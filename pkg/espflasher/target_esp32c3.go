@@ -1,6 +1,9 @@
 package espflasher
 
-import "fmt"
+import (
+	"fmt"
+	"net"
+)
 
 // ESP32-C3 register addresses for USB interface detection and watchdog control.
 // Reference: esptool/targets/esp32c3.py
@@ -9,8 +12,8 @@ const (
 	// Revision < 1 (ECO0-ECO3): base 0x3FCDF064
 	// Revision >= 1 (ECO4+): base 0x3FCDF060
 	// The actual register is 24 bytes (+0x18) from the base address.
-	esp32c3UARTDevBufNoRev0         uint32 = 0x3FCDF07C // 0x3FCDF064 + 24
-	esp32c3UARTDevBufNoRev101       uint32 = 0x3FCDF078 // 0x3FCDF060 + 24
+	esp32c3UARTDevBufNoRev0          uint32 = 0x3FCDF07C // 0x3FCDF064 + 24
+	esp32c3UARTDevBufNoRev101        uint32 = 0x3FCDF078 // 0x3FCDF060 + 24
 	esp32c3UARTDevBufNoUSBJTAGSerial uint32 = 3          // USB-JTAG/Serial active
 
 	// Efuse register for chip version detection.
@@ -27,6 +30,14 @@ const (
 	esp32c3RTCCntlSWDAutoFeedEn uint32 = 1 << 31
 	esp32c3RTCCntlSWDWProtect   uint32 = 0x600080B0
 	esp32c3RTCCntlSWDWKey       uint32 = 0x8F1D312A
+
+	// EFUSE_BLOCK1 base and words used for MAC/revision/feature decoding.
+	// Reference: esptool/targets/esp32c3.py (EFUSE_BLOCK1_ADDR, MAC_EFUSE_REG,
+	// get_major_chip_version/get_minor_chip_version/get_flash_cap/get_flash_vendor).
+	esp32c3EfuseBlock1Word0 uint32 = 0x60008844 // MAC_EFUSE_REG (num_word 0)
+	esp32c3EfuseBlock1Word3 uint32 = 0x60008850 // num_word 3
+	esp32c3EfuseBlock1Word4 uint32 = 0x60008854 // num_word 4
+	esp32c3EfuseBlock1Word5 uint32 = 0x60008858 // num_word 5
 )
 
 // ESP32-C3 target definition.
@@ -70,6 +81,10 @@ var defESP32C3 = &chipDef{
 	FlashSizes: defaultFlashSizes(),
 
 	PostConnect: esp32c3PostConnect,
+
+	ReadMAC:          esp32c3ReadMAC,
+	ReadChipRevision: esp32c3ReadChipRevision,
+	ReadChipFeatures: esp32c3ReadChipFeatures,
 }
 
 // esp32c3ChipRevision reads the chip revision from efuse.
@@ -157,4 +172,76 @@ func disableWatchdogsESP32C3(f *Flasher) error {
 	}
 
 	return nil
+}
+
+// esp32c3ReadMAC reads the factory-programmed base MAC from eFuse.
+// Reference: esptool/targets/esp32c3.py read_mac().
+func esp32c3ReadMAC(f *Flasher) (net.HardwareAddr, error) {
+	word0, err := f.ReadRegister(esp32c3EfuseBlock1Word0)
+	if err != nil {
+		return nil, err
+	}
+	word1, err := f.ReadRegister(esp32c3EfuseBlock1Word0 + 4)
+	if err != nil {
+		return nil, err
+	}
+	return decodeEfuseMAC(word0, word1), nil
+}
+
+// esp32c3ReadChipRevision reads the eFuse-encoded silicon revision.
+// Reference: esptool/targets/esp32c3.py get_major_chip_version()/
+// get_minor_chip_version().
+func esp32c3ReadChipRevision(f *Flasher) (ChipRevision, error) {
+	word3, err := f.ReadRegister(esp32c3EfuseBlock1Word3)
+	if err != nil {
+		return ChipRevision{}, err
+	}
+	word5, err := f.ReadRegister(esp32c3EfuseBlock1Word5)
+	if err != nil {
+		return ChipRevision{}, err
+	}
+	major := (word5 >> 24) & 0x3
+	hi := (word5 >> 23) & 0x1
+	low := (word3 >> 18) & 0x7
+	minor := (hi << 3) + low
+	return ChipRevision{Major: int(major), Minor: int(minor)}, nil
+}
+
+// esp32c3ReadChipFeatures returns the chip feature list.
+// Reference: esptool/targets/esp32c3.py get_chip_features().
+func esp32c3ReadChipFeatures(f *Flasher) ([]string, error) {
+	word3, err := f.ReadRegister(esp32c3EfuseBlock1Word3)
+	if err != nil {
+		return nil, err
+	}
+	word4, err := f.ReadRegister(esp32c3EfuseBlock1Word4)
+	if err != nil {
+		return nil, err
+	}
+
+	features := []string{"Wi-Fi", "BT 5 (LE)", "Single Core", "160MHz"}
+
+	flashCap := (word3 >> 27) & 0x7
+	flash, ok := map[uint32]string{
+		1: "Embedded Flash 4MB",
+		2: "Embedded Flash 2MB",
+		3: "Embedded Flash 1MB",
+		4: "Embedded Flash 8MB",
+	}[flashCap]
+	if !ok && flashCap != 0 {
+		flash = "Unknown Embedded Flash"
+	}
+	if flash != "" {
+		vendorID := word4 & 0x7
+		vendor := map[uint32]string{
+			1: "XMC",
+			2: "GD",
+			3: "FM",
+			4: "TT",
+			5: "ZBIT",
+		}[vendorID]
+		features = append(features, fmt.Sprintf("%s (%s)", flash, vendor))
+	}
+
+	return features, nil
 }

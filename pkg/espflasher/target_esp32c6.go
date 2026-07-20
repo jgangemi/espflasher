@@ -1,5 +1,7 @@
 package espflasher
 
+import "net"
+
 // ESP32-C6 register addresses for USB interface detection and watchdog control.
 // Reference: esptool/targets/esp32c6.py
 const (
@@ -10,6 +12,13 @@ const (
 	esp32c6LPWDTWProtect    uint32 = 0x600B1C18
 	esp32c6LPWDTSWDConf     uint32 = 0x600B1C1C
 	esp32c6LPWDTSWDWProtect uint32 = 0x600B1C20
+
+	// EFUSE_BLOCK1 words used for MAC/revision/feature decoding.
+	// Reference: esptool/targets/esp32c6.py (EFUSE_BLOCK1_ADDR, MAC_EFUSE_REG,
+	// get_major_chip_version/get_minor_chip_version/get_flash_cap).
+	esp32c6EfuseBlock1Word0 uint32 = 0x600B0844 // MAC_EFUSE_REG (num_word 0)
+	esp32c6EfuseBlock1Word3 uint32 = 0x600B0850 // num_word 3
+	esp32c6EfuseBlock1Word4 uint32 = 0x600B0854 // num_word 4
 )
 
 // ESP32-C6 target definition.
@@ -53,6 +62,10 @@ var defESP32C6 = &chipDef{
 	FlashSizes: defaultFlashSizes(),
 
 	PostConnect: esp32c6PostConnect,
+
+	ReadMAC:          esp32c6ReadMAC,
+	ReadChipRevision: esp32c6ReadChipRevision,
+	ReadChipFeatures: esp32c6ReadChipFeatures,
 }
 
 // esp32c6PostConnect detects the USB interface type and disables watchdogs
@@ -74,4 +87,58 @@ func esp32c6PostConnect(f *Flasher) error {
 	}
 
 	return nil
+}
+
+// esp32c6ReadMAC reads the factory-programmed base MAC from eFuse.
+// Reference: esptool/targets/esp32c6.py read_mac().
+func esp32c6ReadMAC(f *Flasher) (net.HardwareAddr, error) {
+	word0, err := f.ReadRegister(esp32c6EfuseBlock1Word0)
+	if err != nil {
+		return nil, err
+	}
+	word1, err := f.ReadRegister(esp32c6EfuseBlock1Word0 + 4)
+	if err != nil {
+		return nil, err
+	}
+	return decodeEfuseMAC(word0, word1), nil
+}
+
+// esp32c6ReadChipRevision reads the eFuse-encoded silicon revision.
+// Reference: esptool/targets/esp32c6.py get_major_chip_version()/
+// get_minor_chip_version().
+func esp32c6ReadChipRevision(f *Flasher) (ChipRevision, error) {
+	word3, err := f.ReadRegister(esp32c6EfuseBlock1Word3)
+	if err != nil {
+		return ChipRevision{}, err
+	}
+	major := (word3 >> 22) & 0x3
+	minor := (word3 >> 18) & 0xF
+	return ChipRevision{Major: int(major), Minor: int(minor)}, nil
+}
+
+// esp32c6ReadChipFeatures returns the chip feature list.
+// Reference: esptool/targets/esp32c6.py get_chip_features().
+func esp32c6ReadChipFeatures(f *Flasher) ([]string, error) {
+	word4, err := f.ReadRegister(esp32c6EfuseBlock1Word4)
+	if err != nil {
+		return nil, err
+	}
+
+	flashCap := word4 & 0x7
+	flash, ok := map[uint32]string{
+		1: "Embedded Flash 4MB",
+		2: "Embedded Flash 8MB",
+	}[flashCap]
+	if !ok {
+		flash = "Unknown Embedded Flash"
+	}
+
+	return []string{
+		"Wi-Fi 6",
+		"BT 5 (LE)",
+		"IEEE802.15.4",
+		"Single Core + LP Core",
+		"160MHz",
+		flash,
+	}, nil
 }

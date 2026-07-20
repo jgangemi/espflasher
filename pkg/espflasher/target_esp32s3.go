@@ -1,6 +1,9 @@
 package espflasher
 
-import "fmt"
+import (
+	"fmt"
+	"net"
+)
 
 // ESP32-S3 register addresses for USB interface detection and watchdog control.
 // Reference: esptool/targets/esp32s3.py
@@ -17,6 +20,17 @@ const (
 	esp32s3RTCCntlSWDAutoFeedEn uint32 = 1 << 31
 	esp32s3RTCCntlSWDWProtect   uint32 = 0x600080B8
 	esp32s3RTCCntlSWDWKey       uint32 = 0x8F1D312A
+
+	// EFUSE_BLOCK1/BLOCK2 words used for MAC/revision/feature decoding.
+	// Reference: esptool/targets/esp32s3.py (EFUSE_BLOCK1_ADDR,
+	// EFUSE_BLOCK2_ADDR, MAC_EFUSE_REG, get_major_chip_version/
+	// get_minor_chip_version/get_blk_version_major/get_blk_version_minor/
+	// get_flash_cap/get_flash_vendor/get_psram_cap/get_psram_vendor).
+	esp32s3EfuseBlock1Word0 uint32 = 0x60007044 // MAC_EFUSE_REG (num_word 0)
+	esp32s3EfuseBlock1Word3 uint32 = 0x60007050 // num_word 3
+	esp32s3EfuseBlock1Word4 uint32 = 0x60007054 // num_word 4
+	esp32s3EfuseBlock1Word5 uint32 = 0x60007058 // num_word 5
+	esp32s3EfuseBlock2Word4 uint32 = 0x6000706C // num_word 4 (BLK_VERSION_MAJOR)
 )
 
 // ESP32-S3 target definition.
@@ -60,6 +74,10 @@ var defESP32S3 = &chipDef{
 	FlashSizes: defaultFlashSizes(),
 
 	PostConnect: esp32s3PostConnect,
+
+	ReadMAC:          esp32s3ReadMAC,
+	ReadChipRevision: esp32s3ReadChipRevision,
+	ReadChipFeatures: esp32s3ReadChipFeatures,
 }
 
 // esp32s3PostConnect detects the USB interface type and disables watchdogs
@@ -122,4 +140,121 @@ func disableWatchdogsESP32S3(f *Flasher) error {
 	}
 
 	return nil
+}
+
+// esp32s3ReadMAC reads the factory-programmed base MAC from eFuse.
+// Reference: esptool/targets/esp32s3.py read_mac().
+func esp32s3ReadMAC(f *Flasher) (net.HardwareAddr, error) {
+	word0, err := f.ReadRegister(esp32s3EfuseBlock1Word0)
+	if err != nil {
+		return nil, err
+	}
+	word1, err := f.ReadRegister(esp32s3EfuseBlock1Word0 + 4)
+	if err != nil {
+		return nil, err
+	}
+	return decodeEfuseMAC(word0, word1), nil
+}
+
+// esp32s3IsEco0 mirrors esptool's ESP32S3ROM.is_eco0(): on v0.0 (ECO0)
+// silicon the major-version field was reallocated for other purposes when
+// the eFuse block version is v1.1, so the raw major/minor fields must be
+// overridden to 0/0 rather than trusted directly.
+// Reference: esptool/targets/esp32s3.py is_eco0()/get_major_chip_version()/
+// get_minor_chip_version().
+func esp32s3IsEco0(rawMinor, blkVerMajor, blkVerMinor uint32) bool {
+	return (rawMinor&0x7) == 0 && blkVerMajor == 1 && blkVerMinor == 1
+}
+
+// esp32s3ReadChipRevision reads the eFuse-encoded silicon revision,
+// including the ECO0 workaround (see esp32s3IsEco0).
+// Reference: esptool/targets/esp32s3.py get_major_chip_version()/
+// get_minor_chip_version()/get_raw_major_chip_version()/
+// get_raw_minor_chip_version()/get_blk_version_major()/get_blk_version_minor().
+func esp32s3ReadChipRevision(f *Flasher) (ChipRevision, error) {
+	word3, err := f.ReadRegister(esp32s3EfuseBlock1Word3)
+	if err != nil {
+		return ChipRevision{}, err
+	}
+	word5, err := f.ReadRegister(esp32s3EfuseBlock1Word5)
+	if err != nil {
+		return ChipRevision{}, err
+	}
+	block2Word4, err := f.ReadRegister(esp32s3EfuseBlock2Word4)
+	if err != nil {
+		return ChipRevision{}, err
+	}
+
+	hi := (word5 >> 23) & 0x1
+	low := (word3 >> 18) & 0x7
+	rawMinor := (hi << 3) + low
+	rawMajor := (word5 >> 24) & 0x3
+
+	blkVerMajor := block2Word4 & 0x3
+	blkVerMinor := (word3 >> 24) & 0x7
+
+	if esp32s3IsEco0(rawMinor, blkVerMajor, blkVerMinor) {
+		return ChipRevision{Major: 0, Minor: 0}, nil
+	}
+	return ChipRevision{Major: int(rawMajor), Minor: int(rawMinor)}, nil
+}
+
+// esp32s3ReadChipFeatures returns the chip feature list.
+// Reference: esptool/targets/esp32s3.py get_chip_features().
+func esp32s3ReadChipFeatures(f *Flasher) ([]string, error) {
+	word3, err := f.ReadRegister(esp32s3EfuseBlock1Word3)
+	if err != nil {
+		return nil, err
+	}
+	word4, err := f.ReadRegister(esp32s3EfuseBlock1Word4)
+	if err != nil {
+		return nil, err
+	}
+	word5, err := f.ReadRegister(esp32s3EfuseBlock1Word5)
+	if err != nil {
+		return nil, err
+	}
+
+	features := []string{"Wi-Fi", "BT 5 (LE)", "Dual Core + LP Core", "240MHz"}
+
+	flashCap := (word3 >> 27) & 0x7
+	flash, ok := map[uint32]string{
+		1: "Embedded Flash 8MB",
+		2: "Embedded Flash 4MB",
+	}[flashCap]
+	if !ok && flashCap != 0 {
+		flash = "Unknown Embedded Flash"
+	}
+	if flash != "" {
+		vendorID := word4 & 0x7
+		vendor := map[uint32]string{
+			1: "XMC",
+			2: "GD",
+			3: "FM",
+			4: "TT",
+			5: "BY",
+		}[vendorID]
+		features = append(features, fmt.Sprintf("%s (%s)", flash, vendor))
+	}
+
+	psramCap := ((word4 >> 3) & 0x3) | (((word5 >> 19) & 0x1) << 2)
+	psram, ok := map[uint32]string{
+		1: "Embedded PSRAM 8MB",
+		2: "Embedded PSRAM 2MB",
+		3: "Embedded PSRAM 16MB",
+		4: "Embedded PSRAM 4MB",
+	}[psramCap]
+	if !ok && psramCap != 0 {
+		psram = "Unknown Embedded PSRAM"
+	}
+	if psram != "" {
+		vendorID := (word4 >> 7) & 0x3
+		vendor := map[uint32]string{
+			1: "AP_3v3",
+			2: "AP_1v8",
+		}[vendorID]
+		features = append(features, fmt.Sprintf("%s (%s)", psram, vendor))
+	}
+
+	return features, nil
 }

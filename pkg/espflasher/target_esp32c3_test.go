@@ -190,6 +190,103 @@ func TestESP32C3PostConnectUART(t *testing.T) {
 	assert.False(t, f.usesUSB, "usesUSB should be false for UART")
 }
 
+func TestESP32C3MAC(t *testing.T) {
+	mc := &mockConnection{
+		readRegFunc: func(addr uint32) (uint32, error) {
+			switch addr {
+			case esp32c3EfuseBlock1Word0:
+				return 0x60559ff7, nil
+			case esp32c3EfuseBlock1Word0 + 4:
+				return 0x00002ca2, nil
+			}
+			return 0, nil
+		},
+	}
+	f := &Flasher{conn: mc, chip: defESP32C3}
+
+	mac, err := f.MAC()
+	require.NoError(t, err)
+	assert.Equal(t, "2c:a2:60:55:9f:f7", mac.String())
+}
+
+func TestESP32C3ChipRevision(t *testing.T) {
+	tests := []struct {
+		name  string
+		word3 uint32
+		word5 uint32
+		want  ChipRevision
+	}{
+		{"v0.0", 0x00000000, 0x00000000, ChipRevision{0, 0}},
+		{"v1.0", 0x00000000, 0x01000000, ChipRevision{1, 0}},
+		{"v1.1", 0x00040000, 0x01000000, ChipRevision{1, 1}},
+		{"max", 0x001c0000, 0x03800000, ChipRevision{3, 15}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := &mockConnection{
+				readRegFunc: func(addr uint32) (uint32, error) {
+					switch addr {
+					case esp32c3EfuseBlock1Word3:
+						return tt.word3, nil
+					case esp32c3EfuseBlock1Word5:
+						return tt.word5, nil
+					}
+					return 0, nil
+				},
+			}
+			f := &Flasher{conn: mc, chip: defESP32C3}
+			got, err := f.ChipRevision()
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestESP32C3ChipFeatures(t *testing.T) {
+	tests := []struct {
+		name  string
+		word3 uint32
+		word4 uint32
+		want  []string
+	}{
+		{"no flash", 0, 0, []string{"Wi-Fi", "BT 5 (LE)", "Single Core", "160MHz"}},
+		{"4MB XMC", 1 << 27, 1, []string{"Wi-Fi", "BT 5 (LE)", "Single Core", "160MHz", "Embedded Flash 4MB (XMC)"}},
+		{"8MB unknown vendor", 4 << 27, 0, []string{"Wi-Fi", "BT 5 (LE)", "Single Core", "160MHz", "Embedded Flash 8MB ()"}},
+		{"unknown cap", 6 << 27, 0, []string{"Wi-Fi", "BT 5 (LE)", "Single Core", "160MHz", "Unknown Embedded Flash ()"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := &mockConnection{
+				readRegFunc: func(addr uint32) (uint32, error) {
+					switch addr {
+					case esp32c3EfuseBlock1Word3:
+						return tt.word3, nil
+					case esp32c3EfuseBlock1Word4:
+						return tt.word4, nil
+					}
+					return 0, nil
+				},
+			}
+			f := &Flasher{conn: mc, chip: defESP32C3}
+			got, err := f.ChipFeatures()
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestESP32C3ReadErrorsPropagate(t *testing.T) {
+	newF := func(readReg func(addr uint32) (uint32, error)) *Flasher {
+		return &Flasher{conn: &mockConnection{readRegFunc: readReg}, chip: defESP32C3}
+	}
+	assertRegisterErrorsPropagate(t, newF, []uint32{esp32c3EfuseBlock1Word0, esp32c3EfuseBlock1Word0 + 4},
+		func(f *Flasher) error { _, err := f.MAC(); return err })
+	assertRegisterErrorsPropagate(t, newF, []uint32{esp32c3EfuseBlock1Word3, esp32c3EfuseBlock1Word5},
+		func(f *Flasher) error { _, err := f.ChipRevision(); return err })
+	assertRegisterErrorsPropagate(t, newF, []uint32{esp32c3EfuseBlock1Word3, esp32c3EfuseBlock1Word4},
+		func(f *Flasher) error { _, err := f.ChipFeatures(); return err })
+}
+
 func TestESP32C3PostConnectSecureMode(t *testing.T) {
 	// Simulate read error (secure download mode)
 	mc := &mockConnection{

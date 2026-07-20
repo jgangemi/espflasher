@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"runtime"
 	"time"
 
@@ -1345,6 +1346,60 @@ func (f *Flasher) FlashID() (uint8, uint16, error) {
 	devID := uint16(((flashID >> 16) & 0xFF) | ((flashID >> 8) & 0xFF << 8))
 
 	return mfgID, devID, nil
+}
+
+// MAC returns the factory-programmed base MAC address read from eFuse.
+// Works both pre- and post-stub, since ReadRegister uses the READ_REG
+// command, which is implemented by both the ROM loader and the stub.
+func (f *Flasher) MAC() (net.HardwareAddr, error) {
+	if f.chip == nil || f.chip.ReadMAC == nil {
+		return nil, &UnsupportedCommandError{Command: "read MAC (chip not detected or unsupported)"}
+	}
+	return f.chip.ReadMAC(f)
+}
+
+// ChipRevision is the eFuse-encoded silicon revision.
+type ChipRevision struct {
+	Major int
+	Minor int
+}
+
+// String returns the revision formatted as "vMAJOR.MINOR".
+func (r ChipRevision) String() string {
+	return fmt.Sprintf("v%d.%d", r.Major, r.Minor)
+}
+
+// ChipRevision reads the eFuse-encoded silicon revision. Works both
+// pre- and post-stub, like MAC.
+func (f *Flasher) ChipRevision() (ChipRevision, error) {
+	if f.chip == nil || f.chip.ReadChipRevision == nil {
+		return ChipRevision{}, &UnsupportedCommandError{Command: "read chip revision (chip not detected or unsupported)"}
+	}
+	return f.chip.ReadChipRevision(f)
+}
+
+// ChipFeatures returns a human-readable feature list, mirroring esptool's
+// get_chip_features(). Works both pre- and post-stub, like MAC.
+func (f *Flasher) ChipFeatures() ([]string, error) {
+	if f.chip == nil || f.chip.ReadChipFeatures == nil {
+		return nil, &UnsupportedCommandError{Command: "read chip features (chip not detected or unsupported)"}
+	}
+	return f.chip.ReadChipFeatures(f)
+}
+
+// decodeEfuseMAC packs two adjacent 32-bit eFuse words into a 6-byte MAC
+// address, mirroring esptool's read_mac(): struct.pack(">II", word1, word0)
+// trimmed to the middle 6 bytes (the leading 2 bytes of word1 are CRC/other
+// bits, not part of the MAC).
+func decodeEfuseMAC(word0, word1 uint32) net.HardwareAddr {
+	return net.HardwareAddr{
+		byte(word1 >> 8),
+		byte(word1),
+		byte(word0 >> 24),
+		byte(word0 >> 16),
+		byte(word0 >> 8),
+		byte(word0),
+	}
 }
 
 // runSPIFlashCommand executes a SPI flash command at the register level.

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"testing"
 )
 
@@ -540,6 +541,121 @@ func TestGetSecurityInfo(t *testing.T) {
 			t.Errorf("unexpected chip ID: got 0x%X, want 0x1234", *info.ChipID)
 		} else {
 			t.Error("unexpected nil ChipID")
+		}
+	}
+}
+
+func TestChipRevisionString(t *testing.T) {
+	rev := ChipRevision{Major: 1, Minor: 2}
+	if got, want := rev.String(), "v1.2"; got != want {
+		t.Errorf("ChipRevision.String() = %q, want %q", got, want)
+	}
+}
+
+func TestMACNilChip(t *testing.T) {
+	f := &Flasher{conn: &mockConnection{}}
+	_, err := f.MAC()
+	if err == nil {
+		t.Fatal("expected error for nil chip")
+	}
+	if _, ok := err.(*UnsupportedCommandError); !ok {
+		t.Errorf("expected UnsupportedCommandError, got %T: %v", err, err)
+	}
+}
+
+func TestMACUnsupportedChip(t *testing.T) {
+	// ESP8266 leaves ReadMAC nil.
+	f := &Flasher{conn: &mockConnection{}, chip: chipDefs[ChipESP8266]}
+	_, err := f.MAC()
+	if err == nil {
+		t.Fatal("expected error for ESP8266")
+	}
+	if _, ok := err.(*UnsupportedCommandError); !ok {
+		t.Errorf("expected UnsupportedCommandError, got %T: %v", err, err)
+	}
+}
+
+func TestChipRevisionNilChip(t *testing.T) {
+	f := &Flasher{conn: &mockConnection{}}
+	_, err := f.ChipRevision()
+	if err == nil {
+		t.Fatal("expected error for nil chip")
+	}
+	if _, ok := err.(*UnsupportedCommandError); !ok {
+		t.Errorf("expected UnsupportedCommandError, got %T: %v", err, err)
+	}
+}
+
+func TestChipRevisionUnsupportedChip(t *testing.T) {
+	f := &Flasher{conn: &mockConnection{}, chip: chipDefs[ChipESP8266]}
+	_, err := f.ChipRevision()
+	if err == nil {
+		t.Fatal("expected error for ESP8266")
+	}
+	if _, ok := err.(*UnsupportedCommandError); !ok {
+		t.Errorf("expected UnsupportedCommandError, got %T: %v", err, err)
+	}
+}
+
+func TestChipFeaturesNilChip(t *testing.T) {
+	f := &Flasher{conn: &mockConnection{}}
+	_, err := f.ChipFeatures()
+	if err == nil {
+		t.Fatal("expected error for nil chip")
+	}
+	if _, ok := err.(*UnsupportedCommandError); !ok {
+		t.Errorf("expected UnsupportedCommandError, got %T: %v", err, err)
+	}
+}
+
+func TestChipFeaturesUnsupportedChip(t *testing.T) {
+	f := &Flasher{conn: &mockConnection{}, chip: chipDefs[ChipESP8266]}
+	_, err := f.ChipFeatures()
+	if err == nil {
+		t.Fatal("expected error for ESP8266")
+	}
+	if _, ok := err.(*UnsupportedCommandError); !ok {
+		t.Errorf("expected UnsupportedCommandError, got %T: %v", err, err)
+	}
+}
+
+func TestMACDispatchesToChip(t *testing.T) {
+	f := &Flasher{conn: &mockConnection{}, chip: chipDefs[ChipESP32C3]}
+	mock := f.conn.(*mockConnection)
+	mock.readRegFunc = func(addr uint32) (uint32, error) {
+		switch addr {
+		case esp32c3EfuseBlock1Word0:
+			return 0x01020304, nil
+		case esp32c3EfuseBlock1Word0 + 4:
+			return 0x00000506, nil
+		}
+		return 0, nil
+	}
+	mac, err := f.MAC()
+	if err != nil {
+		t.Fatalf("MAC() failed: %v", err)
+	}
+	want := net.HardwareAddr{0x05, 0x06, 0x01, 0x02, 0x03, 0x04}
+	if mac.String() != want.String() {
+		t.Errorf("MAC() = %s, want %s", mac, want)
+	}
+}
+
+// assertRegisterErrorsPropagate verifies that call returns a non-nil error
+// when any single register in addrs fails to read, one at a time (all
+// others succeed with 0). This proves every ReadRegister error-check branch
+// in the decoder under test is reachable, not just the first.
+func assertRegisterErrorsPropagate(t *testing.T, newFlasher func(readReg func(addr uint32) (uint32, error)) *Flasher, addrs []uint32, call func(f *Flasher) error) {
+	t.Helper()
+	for _, failAddr := range addrs {
+		f := newFlasher(func(addr uint32) (uint32, error) {
+			if addr == failAddr {
+				return 0, errors.New("register read failed")
+			}
+			return 0, nil
+		})
+		if err := call(f); err == nil {
+			t.Errorf("expected error when register 0x%08X fails to read", failAddr)
 		}
 	}
 }

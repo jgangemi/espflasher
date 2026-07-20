@@ -1,5 +1,7 @@
 package espflasher
 
+import "net"
+
 // ESP32-C5 register addresses for USB interface detection and watchdog control.
 // Reference: esptool/targets/esp32c5.py
 const (
@@ -10,6 +12,12 @@ const (
 	esp32c5LPWDTWProtect    uint32 = 0x600B1C18
 	esp32c5LPWDTSWDConf     uint32 = 0x600B1C1C
 	esp32c5LPWDTSWDWProtect uint32 = 0x600B1C20
+
+	// EFUSE_BLOCK1 words used for MAC/revision decoding.
+	// Reference: esptool/targets/esp32c5.py (EFUSE_BLOCK1_ADDR, MAC_EFUSE_REG,
+	// get_major_chip_version/get_minor_chip_version).
+	esp32c5EfuseBlock1Word0 uint32 = 0x600B4844 // MAC_EFUSE_REG (num_word 0)
+	esp32c5EfuseBlock1Word2 uint32 = 0x600B484C // num_word 2
 )
 
 // ESP32-C5 target definition.
@@ -53,6 +61,10 @@ var defESP32C5 = &chipDef{
 	FlashSizes: defaultFlashSizes(),
 
 	PostConnect: esp32c5PostConnect,
+
+	ReadMAC:          esp32c5ReadMAC,
+	ReadChipRevision: esp32c5ReadChipRevision,
+	ReadChipFeatures: esp32c5ReadChipFeatures,
 }
 
 // esp32c5PostConnect detects the USB interface type and disables watchdogs
@@ -74,4 +86,44 @@ func esp32c5PostConnect(f *Flasher) error {
 	}
 
 	return nil
+}
+
+// esp32c5ReadMAC reads the factory-programmed base MAC from eFuse.
+// Reference: esptool/targets/esp32c5.py read_mac().
+func esp32c5ReadMAC(f *Flasher) (net.HardwareAddr, error) {
+	word0, err := f.ReadRegister(esp32c5EfuseBlock1Word0)
+	if err != nil {
+		return nil, err
+	}
+	word1, err := f.ReadRegister(esp32c5EfuseBlock1Word0 + 4)
+	if err != nil {
+		return nil, err
+	}
+	return decodeEfuseMAC(word0, word1), nil
+}
+
+// esp32c5ReadChipRevision reads the eFuse-encoded silicon revision.
+// Reference: esptool/targets/esp32c5.py get_major_chip_version()/
+// get_minor_chip_version().
+func esp32c5ReadChipRevision(f *Flasher) (ChipRevision, error) {
+	word2, err := f.ReadRegister(esp32c5EfuseBlock1Word2)
+	if err != nil {
+		return ChipRevision{}, err
+	}
+	major := (word2 >> 4) & 0x3
+	minor := word2 & 0xF
+	return ChipRevision{Major: int(major), Minor: int(minor)}, nil
+}
+
+// esp32c5ReadChipFeatures returns the chip feature list. ESP32-C5 has no
+// runtime-detectable flash/PSRAM eFuse bits in esptool, so this is a fixed
+// list. Reference: esptool/targets/esp32c5.py get_chip_features().
+func esp32c5ReadChipFeatures(f *Flasher) ([]string, error) {
+	return []string{
+		"Wi-Fi 6 (dual-band)",
+		"BT 5 (LE)",
+		"IEEE802.15.4",
+		"Single Core + LP Core",
+		"240MHz",
+	}, nil
 }
