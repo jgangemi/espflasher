@@ -1,6 +1,9 @@
 package espflasher
 
-import "fmt"
+import (
+	"fmt"
+	"net"
+)
 
 // ChipType identifies the ESP chip family.
 type ChipType int
@@ -135,6 +138,19 @@ type chipDef struct {
 	// usesUSB/hardReset path. Nil for chips without a native-OTG reset
 	// mechanism.
 	HardResetOTG func(f *Flasher) bool
+
+	// ReadMAC reads the factory-programmed base MAC address from eFuse.
+	// Nil for chips (ESP8266) that don't expose it via this scheme.
+	ReadMAC func(f *Flasher) (net.HardwareAddr, error)
+
+	// ReadChipRevision reads the eFuse-encoded silicon revision.
+	// Nil for chips (ESP8266) that don't expose it via this scheme.
+	ReadChipRevision func(f *Flasher) (ChipRevision, error)
+
+	// ReadChipFeatures reads (or, for chips with no runtime-detectable
+	// feature bits, returns a fixed list of) the chip's feature set.
+	// Nil for chips (ESP8266) that don't expose it via this scheme.
+	ReadChipFeatures func(f *Flasher) ([]string, error)
 }
 
 // chipDetectMagicRegAddr is the register address that has a different

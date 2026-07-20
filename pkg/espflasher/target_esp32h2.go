@@ -1,15 +1,25 @@
 package espflasher
 
+import "net"
+
 // ESP32-H2 register addresses for USB interface detection and watchdog control.
 // Reference: esptool/targets/esp32h2.py
 const (
 	esp32h2UARTDevBufNo              uint32 = 0x4084FEFC // ROM .bss: active console interface
 	esp32h2UARTDevBufNoUSBJTAGSerial uint32 = 3          // USB-JTAG/Serial active
 
-	esp32h2LPWDTConfig0      uint32 = 0x600B1C00
-	esp32h2LPWDTWProtect     uint32 = 0x600B1C1C // H2 offset differs from C6
-	esp32h2LPWDTSWDConf      uint32 = 0x600B1C20
-	esp32h2LPWDTSWDWProtect  uint32 = 0x600B1C24
+	esp32h2LPWDTConfig0     uint32 = 0x600B1C00
+	esp32h2LPWDTWProtect    uint32 = 0x600B1C1C // H2 offset differs from C6
+	esp32h2LPWDTSWDConf     uint32 = 0x600B1C20
+	esp32h2LPWDTSWDWProtect uint32 = 0x600B1C24
+
+	// EFUSE_BLOCK1 words used for MAC/revision decoding. H2 shares C6's
+	// EFUSE_BASE (0x600B0800) but has a 3-bit minor-version mask, not C6's
+	// 4-bit mask.
+	// Reference: esptool/targets/esp32h2.py (EFUSE_BLOCK1_ADDR, MAC_EFUSE_REG,
+	// get_major_chip_version/get_minor_chip_version).
+	esp32h2EfuseBlock1Word0 uint32 = 0x600B0844 // MAC_EFUSE_REG (num_word 0)
+	esp32h2EfuseBlock1Word3 uint32 = 0x600B0850 // num_word 3
 )
 
 // ESP32-H2 target definition.
@@ -54,6 +64,10 @@ var defESP32H2 = &chipDef{
 	FlashSizes: defaultFlashSizes(),
 
 	PostConnect: esp32h2PostConnect,
+
+	ReadMAC:          esp32h2ReadMAC,
+	ReadChipRevision: esp32h2ReadChipRevision,
+	ReadChipFeatures: esp32h2ReadChipFeatures,
 }
 
 // esp32h2PostConnect detects the USB interface type and disables watchdogs
@@ -75,4 +89,39 @@ func esp32h2PostConnect(f *Flasher) error {
 	}
 
 	return nil
+}
+
+// esp32h2ReadMAC reads the factory-programmed base MAC from eFuse.
+// Reference: esptool/targets/esp32h2.py read_mac().
+func esp32h2ReadMAC(f *Flasher) (net.HardwareAddr, error) {
+	word0, err := f.ReadRegister(esp32h2EfuseBlock1Word0)
+	if err != nil {
+		return nil, err
+	}
+	word1, err := f.ReadRegister(esp32h2EfuseBlock1Word0 + 4)
+	if err != nil {
+		return nil, err
+	}
+	return decodeEfuseMAC(word0, word1), nil
+}
+
+// esp32h2ReadChipRevision reads the eFuse-encoded silicon revision. Note
+// the minor version is a 3-bit mask here, unlike C6's 4-bit mask.
+// Reference: esptool/targets/esp32h2.py get_major_chip_version()/
+// get_minor_chip_version().
+func esp32h2ReadChipRevision(f *Flasher) (ChipRevision, error) {
+	word3, err := f.ReadRegister(esp32h2EfuseBlock1Word3)
+	if err != nil {
+		return ChipRevision{}, err
+	}
+	major := (word3 >> 21) & 0x3
+	minor := (word3 >> 18) & 0x7
+	return ChipRevision{Major: int(major), Minor: int(minor)}, nil
+}
+
+// esp32h2ReadChipFeatures returns the chip feature list. ESP32-H2 has no
+// runtime-detectable flash/PSRAM eFuse bits in esptool, so this is a fixed
+// list. Reference: esptool/targets/esp32h2.py get_chip_features().
+func esp32h2ReadChipFeatures(f *Flasher) ([]string, error) {
+	return []string{"BT 5 (LE)", "IEEE802.15.4", "Single Core", "96MHz"}, nil
 }

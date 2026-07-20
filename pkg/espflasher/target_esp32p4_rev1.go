@@ -1,22 +1,32 @@
 package espflasher
 
+import "net"
+
 // ESP32-P4 Rev1 (ECO2, chip revision < 3.0) register addresses for USB
 // interface detection and watchdog control.
 // Reference: esptool/targets/esp32p4.py (P4-specific values) and
 // esptool/targets/esp32.py (ESP32ROM base-class SPI defaults P4 inherits).
 //
 // UARTDEV_BUF_NO is revision-dependent in esptool:
-//   rev <  3.0 (ECO2, this target):  0x4FF3FEB0 + 24 = 0x4FF3FEC8
-//   rev >= 3.0 (production, future): 0x4FFBFEB0 + 24 = 0x4FFBFEC8
+//
+//	rev <  3.0 (ECO2, this target):  0x4FF3FEB0 + 24 = 0x4FF3FEC8
+//	rev >= 3.0 (production, future): 0x4FFBFEB0 + 24 = 0x4FFBFEC8
+//
 // The USB-JTAG/Serial sentinel is 6 on P4 (not 3 like C5/C6/H2).
 const (
-	esp32p4Rev1UARTDevBufNo              uint32 = 0x4FF3FEC8
-	esp32p4UARTDevBufNoUSBJTAGSerial     uint32 = 6
+	esp32p4Rev1UARTDevBufNo          uint32 = 0x4FF3FEC8
+	esp32p4UARTDevBufNoUSBJTAGSerial uint32 = 6
 
 	esp32p4LPWDTConfig0     uint32 = 0x50116000
 	esp32p4LPWDTWProtect    uint32 = 0x50116018
 	esp32p4LPWDTSWDConf     uint32 = 0x5011601C
 	esp32p4LPWDTSWDWProtect uint32 = 0x50116020
+
+	// EFUSE_BLOCK1 words used for MAC/revision decoding.
+	// Reference: esptool/targets/esp32p4.py (EFUSE_BLOCK1_ADDR, MAC_EFUSE_REG,
+	// get_major_chip_version/get_minor_chip_version).
+	esp32p4EfuseBlock1Word0 uint32 = 0x5012D044 // MAC_EFUSE_REG (num_word 0)
+	esp32p4EfuseBlock1Word2 uint32 = 0x5012D04C // num_word 2
 )
 
 // ESP32-P4 Rev1 target definition.
@@ -62,6 +72,10 @@ var defESP32P4Rev1 = &chipDef{
 	FlashSizes: defaultFlashSizes(),
 
 	PostConnect: esp32p4Rev1PostConnect,
+
+	ReadMAC:          esp32p4Rev1ReadMAC,
+	ReadChipRevision: esp32p4Rev1ReadChipRevision,
+	ReadChipFeatures: esp32p4Rev1ReadChipFeatures,
 }
 
 func esp32p4Rev1PostConnect(f *Flasher) error {
@@ -77,4 +91,40 @@ func esp32p4Rev1PostConnect(f *Flasher) error {
 	}
 
 	return nil
+}
+
+// esp32p4Rev1ReadMAC reads the factory-programmed base MAC from eFuse.
+// Reference: esptool/targets/esp32p4.py read_mac().
+func esp32p4Rev1ReadMAC(f *Flasher) (net.HardwareAddr, error) {
+	word0, err := f.ReadRegister(esp32p4EfuseBlock1Word0)
+	if err != nil {
+		return nil, err
+	}
+	word1, err := f.ReadRegister(esp32p4EfuseBlock1Word0 + 4)
+	if err != nil {
+		return nil, err
+	}
+	return decodeEfuseMAC(word0, word1), nil
+}
+
+// esp32p4Rev1ReadChipRevision reads the eFuse-encoded silicon revision.
+// The major version is split: bit 2 comes from eFuse bit 23, bits 1:0 come
+// from eFuse bits 5:4.
+// Reference: esptool/targets/esp32p4.py get_major_chip_version()/
+// get_minor_chip_version().
+func esp32p4Rev1ReadChipRevision(f *Flasher) (ChipRevision, error) {
+	word2, err := f.ReadRegister(esp32p4EfuseBlock1Word2)
+	if err != nil {
+		return ChipRevision{}, err
+	}
+	major := (((word2 >> 23) & 0x1) << 2) | ((word2 >> 4) & 0x3)
+	minor := word2 & 0xF
+	return ChipRevision{Major: int(major), Minor: int(minor)}, nil
+}
+
+// esp32p4Rev1ReadChipFeatures returns the chip feature list. ESP32-P4 has
+// no runtime-detectable flash/PSRAM eFuse bits in esptool, so this is a
+// fixed list. Reference: esptool/targets/esp32p4.py get_chip_features().
+func esp32p4Rev1ReadChipFeatures(f *Flasher) ([]string, error) {
+	return []string{"Dual Core + LP Core", "400MHz"}, nil
 }

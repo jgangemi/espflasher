@@ -2,6 +2,7 @@ package espflasher
 
 import (
 	"fmt"
+	"net"
 	"time"
 )
 
@@ -41,6 +42,15 @@ const (
 	esp32s2GPIOStrapSPIBootMask     uint32 = 1 << 3
 	esp32s2RTCCntlOption1Reg        uint32 = 0x3F408128
 	esp32s2RTCCntlForceDownloadBoot uint32 = 0x1
+
+	// EFUSE_BLOCK1/BLOCK2 words used for MAC/revision/feature decoding.
+	// Reference: esptool/targets/esp32s2.py (EFUSE_BLOCK1_ADDR,
+	// EFUSE_BLOCK2_ADDR, MAC_EFUSE_REG, get_major_chip_version/
+	// get_minor_chip_version/get_flash_cap/get_psram_cap/get_block2_version).
+	esp32s2EfuseBlock1Word0 uint32 = 0x3F41A044 // MAC_EFUSE_REG (num_word 0)
+	esp32s2EfuseBlock1Word3 uint32 = 0x3F41A050 // num_word 3
+	esp32s2EfuseBlock1Word4 uint32 = 0x3F41A054 // num_word 4
+	esp32s2EfuseBlock2Word4 uint32 = 0x3F41A06C // num_word 4 (BLK_VERSION_MINOR)
 )
 
 // ESP32-S2 target definition.
@@ -87,6 +97,10 @@ var defESP32S2 = &chipDef{
 
 	PostConnect:  esp32s2PostConnect,
 	HardResetOTG: esp32s2HardReset,
+
+	ReadMAC:          esp32s2ReadMAC,
+	ReadChipRevision: esp32s2ReadChipRevision,
+	ReadChipFeatures: esp32s2ReadChipFeatures,
 }
 
 // esp32s2PostConnect detects the USB interface type.
@@ -167,4 +181,89 @@ func esp32s2WatchdogReset(f *Flasher) error {
 	time.Sleep(500 * time.Millisecond) // wait for reset to take effect
 
 	return nil
+}
+
+// esp32s2ReadMAC reads the factory-programmed base MAC from eFuse.
+// Reference: esptool/targets/esp32s2.py read_mac().
+func esp32s2ReadMAC(f *Flasher) (net.HardwareAddr, error) {
+	word0, err := f.ReadRegister(esp32s2EfuseBlock1Word0)
+	if err != nil {
+		return nil, err
+	}
+	word1, err := f.ReadRegister(esp32s2EfuseBlock1Word0 + 4)
+	if err != nil {
+		return nil, err
+	}
+	return decodeEfuseMAC(word0, word1), nil
+}
+
+// esp32s2ReadChipRevision reads the eFuse-encoded silicon revision.
+// Reference: esptool/targets/esp32s2.py get_major_chip_version()/
+// get_minor_chip_version().
+func esp32s2ReadChipRevision(f *Flasher) (ChipRevision, error) {
+	word3, err := f.ReadRegister(esp32s2EfuseBlock1Word3)
+	if err != nil {
+		return ChipRevision{}, err
+	}
+	word4, err := f.ReadRegister(esp32s2EfuseBlock1Word4)
+	if err != nil {
+		return ChipRevision{}, err
+	}
+	major := (word3 >> 18) & 0x3
+	hi := (word3 >> 20) & 0x1
+	low := (word4 >> 4) & 0x7
+	minor := (hi << 3) + low
+	return ChipRevision{Major: int(major), Minor: int(minor)}, nil
+}
+
+// esp32s2ReadChipFeatures returns the chip feature list.
+// Reference: esptool/targets/esp32s2.py get_chip_features().
+func esp32s2ReadChipFeatures(f *Flasher) ([]string, error) {
+	word3, err := f.ReadRegister(esp32s2EfuseBlock1Word3)
+	if err != nil {
+		return nil, err
+	}
+	block2Word4, err := f.ReadRegister(esp32s2EfuseBlock2Word4)
+	if err != nil {
+		return nil, err
+	}
+
+	flashCap := (word3 >> 21) & 0xF
+	flashVersion, ok := map[uint32]string{
+		0: "No Embedded Flash",
+		1: "Embedded Flash 2MB",
+		2: "Embedded Flash 4MB",
+	}[flashCap]
+	if !ok {
+		flashVersion = "Unknown Embedded Flash"
+	}
+
+	psramCap := (word3 >> 28) & 0xF
+	psramVersion, ok := map[uint32]string{
+		0: "No Embedded PSRAM",
+		1: "Embedded PSRAM 2MB",
+		2: "Embedded PSRAM 4MB",
+	}[psramCap]
+	if !ok {
+		psramVersion = "Unknown Embedded PSRAM"
+	}
+
+	block2Version := (block2Word4 >> 4) & 0x7
+	block2VersionStr, ok := map[uint32]string{
+		0: "No calibration in BLK2 of efuse",
+		1: "ADC and temperature sensor calibration in BLK2 of eFuse V1",
+		2: "ADC and temperature sensor calibration in BLK2 of eFuse V2",
+	}[block2Version]
+	if !ok {
+		block2VersionStr = "Unknown calibration in BLK2"
+	}
+
+	return []string{
+		"Wi-Fi",
+		"Single Core",
+		"240MHz",
+		flashVersion,
+		psramVersion,
+		block2VersionStr,
+	}, nil
 }
